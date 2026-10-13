@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Kythera Shader",
     "author": "Jideeh",
-    "version": (1, 6, 1),
+    "version": (1, 6, 3),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Kythera",
     "description": "Swap ZZZ shaders for Kythera's ZZZ Shader and carry over textures. "
@@ -565,6 +565,7 @@ def _kysh_ensure_sun(context):
             if sun.name in bpy.data.objects and sun.type == 'LIGHT':
                 if sun.name not in scn.objects:
                     scn.collection.objects.link(sun)
+                sun.data.use_shadow = True
                 return sun
         except ReferenceError:
             pass
@@ -574,15 +575,44 @@ def _kysh_ensure_sun(context):
         data.energy = _KYSH_SUN_ENERGY
         data.color = (1.0, 1.0, 1.0)
         data.angle = 0.009180432185530663
-        data.use_shadow = False
         sun = bpy.data.objects.new(_KYSH_SUN_NAME, data)
         sun.rotation_euler = _KYSH_SUN_ROT
         #location doesnt matter for a sun lamp but it looks lonely at the origin
         sun.location = (0.0, 0.0, 3.0)
+    sun.data.use_shadow = True
     if sun.name not in scn.objects:
         scn.collection.objects.link(sun)
     scn.kythera_sun = sun
     return sun
+
+
+#render shadows on, sun shadows on, world pitch black. the toon look hates ambient light
+def _kysh_scene_setup(context):
+    scn = context.scene
+    eevee = getattr(scn, "eevee", None)
+    if eevee is not None and hasattr(eevee, "use_shadows"):
+        eevee.use_shadows = True
+    _kysh_ensure_sun(context)
+    world = scn.world
+    if world is None:
+        world = bpy.data.worlds.new("World")
+        scn.world = world
+    world.color = (0.0, 0.0, 0.0)
+    if hasattr(world, "use_nodes") and not world.use_nodes:
+        world.use_nodes = True
+    nt = world.node_tree
+    if nt is None:
+        return
+    bg = next((n for n in nt.nodes if n.type == 'BACKGROUND'), None)
+    if bg is None:
+        #no background node?? who did this to u
+        bg = nt.nodes.new('ShaderNodeBackground')
+        out = next((n for n in nt.nodes if n.type == 'OUTPUT_WORLD'), None) or nt.nodes.new('ShaderNodeOutputWorld')
+        nt.links.new(bg.outputs[0], out.inputs["Surface"])
+    col = bg.inputs["Color"]
+    for link in list(col.links):
+        nt.links.remove(link)
+    col.default_value = (0.0, 0.0, 0.0, 1.0)
 
 
 def _kysh_new_node(tree, idname, loc):
@@ -908,10 +938,55 @@ def _kysh_apply_from_file(context, filepath, objs=None, raw_folder=None):
         objs = _kysh_targets(context)
     total, faces = _kysh_convert_targets(context, objs, body_src, face_src, raw_folder)
     _kysh_fix_all_colorspaces()
+    _kysh_scene_setup(context)
     _kysh_cleanup(appended)
-    if context.scene.kythera_shader_use_cache:
-        context.scene.kythera_shader_last_file = filepath
+    _kysh_set_cached(context, filepath)
     return total, faces, None
+
+
+#shader blend cache lives in the addon prefs now so it survives new files n restarts
+#the old scene prop is only read as a fallback for scenes made w older versions
+def _kysh_get_cached(context):
+    prefs = _kysh_prefs()
+    path = prefs.shader_path if prefs is not None else ""
+    if not path:
+        path = getattr(context.scene, "kythera_shader_last_file", "")
+    path = bpy.path.abspath(path) if path else ""
+    return path if path and os.path.isfile(path) else ""
+
+def _kysh_cache_enabled():
+    prefs = _kysh_prefs()
+    return prefs.use_shader_cache if prefs is not None else True
+
+
+def _kysh_set_cached(context, path):
+    if not _kysh_cache_enabled():
+        return
+    context.scene.kythera_shader_last_file = path
+    prefs = _kysh_prefs()
+    if prefs is None or prefs.shader_path == path:
+        return
+    prefs.shader_path = path
+    #save prefs right away, blender only autosaves them on quit n crashes dont count lol
+    try:
+        context.preferences.is_dirty = True
+        if not context.preferences.use_preferences_save:
+            bpy.ops.wm.save_userpref()
+    except (RuntimeError, AttributeError):
+        pass
+
+
+def _kysh_clear_cached(context):
+    context.scene.kythera_shader_last_file = ""
+    prefs = _kysh_prefs()
+    if prefs is not None:
+        prefs.shader_path = ""
+        try:
+            context.preferences.is_dirty = True
+            if not context.preferences.use_preferences_save:
+                bpy.ops.wm.save_userpref()
+        except (RuntimeError, AttributeError):
+            pass
 
 
 def _kysh_report(op, total, faces):
@@ -933,14 +1008,15 @@ class JIDEEH_OT_import_kythera_shader(Operator, ImportHelper):
     filter_glob: StringProperty(default="*.blend", options={'HIDDEN'})
 
     def invoke(self, context, event):
-        scn = context.scene
-        cached = scn.kythera_shader_last_file
-        if scn.kythera_shader_use_cache and cached and os.path.isfile(cached):
+        #already know where the blend is so skip the file browser entirely
+        cached = _kysh_get_cached(context)
+        if _kysh_cache_enabled() and cached:
+            self.filepath = cached
             return self.execute(context)
         return ImportHelper.invoke(self, context, event)
 
     def execute(self, context):
-        path = self.filepath if self.filepath else context.scene.kythera_shader_last_file
+        path = self.filepath if self.filepath else _kysh_get_cached(context)
         total, faces, err = _kysh_apply_from_file(context, path)
         if err is not None:
             self.report({'ERROR'}, err)
@@ -960,8 +1036,8 @@ class JIDEEH_OT_kythera_import_fbx(Operator, ImportHelper):
     filter_glob: StringProperty(default="*.fbx", options={'HIDDEN'})
 
     def execute(self, context):
-        shader = context.scene.kythera_shader_last_file
-        if not shader or not os.path.isfile(shader):
+        shader = _kysh_get_cached(context)
+        if not shader:
             self.report({'ERROR'}, "Pick Kythera's shader .blend first (Import Kythera's Shader)")
             return {'CANCELLED'}
         before = set(bpy.data.objects)
@@ -986,7 +1062,7 @@ class JIDEEH_OT_kythera_reapply(Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        total, faces, err = _kysh_apply_from_file(context, context.scene.kythera_shader_last_file)
+        total, faces, err = _kysh_apply_from_file(context, _kysh_get_cached(context))
         if err is not None:
             self.report({'ERROR'}, err)
             return {'CANCELLED'}
@@ -1014,11 +1090,13 @@ class JIDEEH_OT_kythera_setup_face(Operator):
 class JIDEEH_OT_kythera_clear_cache(Operator):
     bl_idname = "jideeh.kythera_clear_cache"
     bl_label = "Clear Cache"
+    bl_description = ("Forget the cached shader .blend. Next Import Kythera's Shader opens the file browser "
+                      "so you can pick a newer version")
     bl_options = {'REGISTER'}
 
     def execute(self, context):
-        context.scene.kythera_shader_last_file = ""
-        self.report({'INFO'}, "Cleared cached shader file")
+        _kysh_clear_cached(context)
+        self.report({'INFO'}, "Cleared cached shader file, next import will ask for it again")
         return {'FINISHED'}
 
 
@@ -1314,9 +1392,31 @@ def _kysh_startup_check():
 #turn it off and on again, the ancient IT ritual
 def _kysh_reload_addon():
     import addon_utils
+    import sys
     name = __name__
+    #disabling an addon wipes its prefs so stash em first or the shader cache goes poof
+    saved = {}
+    prefs = _kysh_prefs()
+    if prefs is not None:
+        for key in ("shader_path", "use_shader_cache", "auto_check", "auto_install",
+                    "include_prerelease", "check_interval_hours", "last_check"):
+            saved[key] = getattr(prefs, key)
     addon_utils.disable(name, default_set=True)  #brb
+    sys.modules.pop(name, None)  #make sure we actually load the new file n not the old one in memory
     addon_utils.enable(name, default_set=True)  #reimports bc the file changed ngl
+    addon = bpy.context.preferences.addons.get(name)
+    if addon is not None and saved:
+        for key, val in saved.items():
+            try:
+                setattr(addon.preferences, key, val)
+            except (AttributeError, TypeError):
+                pass
+        try:
+            bpy.context.preferences.is_dirty = True
+            if not bpy.context.preferences.use_preferences_save:
+                bpy.ops.wm.save_userpref()
+        except RuntimeError:
+            pass
     return None
 
 
@@ -1415,9 +1515,26 @@ class KytheraShaderPreferences(AddonPreferences):
         description="0 = every time Blender starts",
     )
     last_check: FloatProperty(default=0.0, options={'HIDDEN'})
+    shader_path: StringProperty(
+        name="Shader .blend",
+        description="Cached Kythera's shader file, used by every import without asking again",
+        subtype='FILE_PATH',
+        default="",
+    )
+    use_shader_cache: BoolProperty(
+        name="Remember shader file",
+        description="Skip the file browser on Import Kythera's Shader once a file was picked",
+        default=True,
+    )
 
     def draw(self, context):
         layout = self.layout
+        sbox = layout.box()
+        sbox.label(text="Shader file", icon='BLENDER')
+        sbox.prop(self, "use_shader_cache")
+        row = sbox.row(align=True)
+        row.prop(self, "shader_path", text="")
+        row.operator("jideeh.kythera_clear_cache", text="", icon='X')
         box = layout.box()
         box.label(text="Updates", icon='WORLD')
         box.prop(self, "auto_check")
@@ -1477,8 +1594,13 @@ class JIDEEH_PT_kythera_shader(Panel):
         row.operator("jideeh.kythera_import_fbx", icon='ARMATURE_DATA')
         row = col.row(align=True)
         row.operator("jideeh.kythera_reapply", icon='FILE_REFRESH')
-        if scn.kythera_shader_last_file:
-            col.label(text=os.path.basename(scn.kythera_shader_last_file), icon='BLENDER')
+        cached = _kysh_get_cached(context)
+        row = menu.row(align=True)
+        if cached:
+            row.label(text=os.path.basename(cached), icon='BLENDER')
+            row.operator("jideeh.kythera_clear_cache", text="", icon='X')
+        else:
+            row.label(text="No shader cached yet", icon='QUESTION')
 
         box, expanded = _kysh_draw_subpanel(menu, scn, "kythera_shader_show_light", "Light", 'LIGHT_SUN')
         if expanded:
@@ -1497,7 +1619,9 @@ class JIDEEH_PT_kythera_shader(Panel):
             tools.operator("jideeh.kythera_fix_colorspace", icon='IMAGE_DATA')
             row = box.row(align=True)
             row.operator("jideeh.kythera_clear_cache", text="Clear Cache", icon='TRASH')
-            row.prop(scn, "kythera_shader_use_cache", text="Cache")
+            prefs = _kysh_prefs()
+            if prefs is not None:
+                row.prop(prefs, "use_shader_cache", text="Cache")
 
         box, expanded = _kysh_draw_subpanel(menu, scn, "kythera_shader_show_update", "Updates", 'WORLD')
         if expanded:
