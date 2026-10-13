@@ -1,4 +1,4 @@
-# Kythera's Shader
+# Kythera's Shader + Addon
 
 blender addon that slaps Kythera's ZZZ shader on zenless zone zero models n carries all the textures over so u dont have to plug 40 image nodes by hand lmao
 
@@ -45,7 +45,7 @@ just click **Import Kythera's Shader**. every mesh in the scene gets converted
 - adds a **Kythera Face Vectors** geo nodes modifier to the face that feeds the sun n head direction to the face shader
 - hides hair shadow stencil meshes, they r only useful in game
 
-## panel
+## Addon Panel
 
 | thing                   | what it do                                                                            |
 | ----------------------- | ------------------------------------------------------------------------------------- |
@@ -57,18 +57,25 @@ just click **Import Kythera's Shader**. every mesh in the scene gets converted
 | Tools                   | select unconverted, purge old mats, fix texture color spaces, clear cache             |
 | Updates                 | check for updates, install, reload addon                                              |
 
-## updates
+## Updates
 
 on by default. on startup it checks this repo's releases (every 12h max), downloads the new one n keeps a `.bak` of the old file. restart blender or hit **Reload Add-on** to use it
 
 turn it off or change how often in Preferences > Add-ons > Kythera Shader
 
-## troubleshooting
+## Troubleshooting
 
-- **face shadow on the wrong side**: the addon assumes ur character faces -Y when converting. rotate the Head Direction empty 180 on Z if u converted it facing somewhere else
-- **face fully lit**: sun is in front of the face, thats normal for this shader. rotate the sun to the side
-- **textures missing on raw fbx**: textures need to be in the same folder as the fbx (or a `Textures` folder next to it)
-- **want a newer kythera blend**: clear cache, import again, pick the new file
+- **Face shadow on the wrong side**: the addon assumes ur character faces -Y when converting. rotate the Head Direction empty 180 on Z if u converted it facing somewhere else
+- **No shadows**: Set world background color to black or use the camera ray technique to keep a custom background. It's not a nice fix but if there are solutions to this, let me know.
+- **Skin looks yellow/weird brightening around light/shadow boundary**: turn off SSS. This will be reworked in the next shader update
+- **Face fully lit**: sun is in front of the face, thats normal for this shader. rotate the sun to the side
+- **Textures missing on raw fbx**: textures need to be in the same folder as the fbx (or a `Textures` folder next to it)
+- **Want a newer kythera blend**: clear cache, import again, pick the new file
+
+## Notes from Kythera
+- The shader is actually two shaders: one for the face and one for the body.
+  - The body shader allows types of light sources other than Sun (Area, Point, Spotlight). It also allows for multiple lights to affect the body shader, which can get messy quickly so just use light/shadow linking if necessary
+  - the face shader strictly follows the sun light direction, meaning a point light will NOT affect the face (you might notice some slight hair shadows but this will be fixed). This will work even if the sun is hidden, so you can definitely use it as just a light direction while keeping it hidden from renders, and use other lights to illuminate the rest of the body.
 
 ## publishing a release (note to self)
 
