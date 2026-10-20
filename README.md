@@ -41,7 +41,10 @@ just click **Import Kythera's Shader**. every mesh in the scene gets converted
 - \_D is sRGB, \_M \_A \_N are Non-Color (they're data maps, not colors)
 - gives every face its own lightmap (from the json on raw fbx, from the old face material on setup wizard models) so male n female faces both look right
 - face \_D is set to premultiplied alpha
-- the eye shadow mat becomes **Eye Shadow**: face \_D into a Transparent BSDF, thats it
+- the eye mat gets split using the vertex colors zzz bakes into the eye mesh (same split the setup wizard does):
+  - irises, pupils n sparkles get the face shader
+  - the shadow strip over the eye becomes **Eye Shadow**: face \_D into a Transparent BSDF, thats it
+  - the soft gloss over the iris becomes **Eye Highlights**. it uses `Kythera's ZZZ Eye Highlights` from the shader blend if its in there, otherwise a built in one (face \_D alpha into a color ramp mixing transparent n the face \_D color)
 - adds a **Kythera Sun**. the toon shading n the face shadow both follow it
 - adds a **Head Direction** empty parented to the head bone so the face shadow moves w the head
 - adds a **Kythera Face Vectors** geo nodes modifier to the face that feeds the sun n head direction to the face shader
