@@ -53,7 +53,8 @@ two buttons in the **Outlines** box, both inverted hull, outline color is the \_
 
 - **Add Outlines** works like the setup wizard: geo nodes w Merge by Distance on body meshes, Solidify on the face
 - **Add Fast Outlines** is the light version. seams get welded once when u click the button instead of every frame, n the hull comes out as an instance so blender doesnt have to copy the whole mesh (vertex groups n all) every frame. on raw Miyabi its about 2x cheaper to pose/playback than the wizard style one. width follows the vertex color red channel so eyes n mouth dont get outlines
-- **Thickness**, **Screen Space** (width scales w distance to the scene camera) n **Viewport** (hide them while posing, they still render) apply to every outline at once
+- every mesh w a material gets outlines, not just the converted ones
+- the body mesh is the boss. its outline modifier has **Thickness**, **Outline Color**, **Flat Color** (0 = darkened texture, 1 = ur Outline Color) n **Screen Space**, n every other mesh's outline is driven from it. turn the body's outline modifier off n they all turn off. the same settings show up in the Outlines box
 - **Remove Outlines** takes everything back off
 
 ## Addon Panel
@@ -65,7 +66,7 @@ two buttons in the **Outlines** box, both inverted hull, outline color is the \_
 | Reapply To New Objects  | converts stuff u added after                                                          |
 | shader filename + X     | the cached blend. X forgets it so u can pick a newer one                              |
 | Light                   | pick the sun, rotate it, change strength, **Fix Face Lighting** redoes the face setup |
-| Outlines                | add wizard style or fast outlines, thickness, screen space, viewport toggle, remove   |
+| Outlines                | add wizard style or fast outlines, body mesh controls for all of them, remove        |
 | Tools                   | select unconverted, purge old mats, fix texture color spaces, clear cache             |
 | Updates                 | check for updates, install, reload addon                                              |
 
