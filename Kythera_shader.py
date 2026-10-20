@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Kythera Shader",
     "author": "Jideeh",
-    "version": (1, 6, 3),
+    "version": (1, 7, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Kythera",
     "description": "Swap ZZZ shaders for Kythera's ZZZ Shader and carry over textures. "
@@ -20,6 +20,7 @@ import threading
 #yes we're downloading stuff from the internet inside blender, what could go wrong lol
 import urllib.request
 import bpy
+import numpy as np
 from mathutils import Matrix, Vector
 from bpy.props import StringProperty, BoolProperty, PointerProperty, IntProperty, FloatProperty
 from bpy.types import Operator, Panel, AddonPreferences
@@ -78,6 +79,21 @@ _KYSH_SUN_ENERGY = 2.0
 
 #what a mat ends up as
 _K_BODY, _K_FACE, _K_HIDE, _K_SKIP = "BODY", "FACE", "HIDE", "SKIP"
+_K_DELETE, _K_EYE = "DELETE", "EYE"
+
+_KYSH_EYE_SHADOW = "Eye Shadow"
+_KYSH_ROLE = "kysh_role"
+_KYSH_OL_GN = "Kythera ZZZ Outlines"
+_KYSH_OL_FAST_GN = "Kythera ZZZ Outlines (Fast)"
+_KYSH_OL_MOD = "Kythera Outlines"
+_KYSH_OL_FACE_MOD = "Kythera Face Outlines"
+_KYSH_OL_SUFFIX = " Outline"
+_KYSH_OL_HIDDEN = "Kythera Outline Hidden"
+_KYSH_OL_WELD = "kysh_ol_weld"
+_KYSH_OL_WIDTH = "kysh_ol_width"
+_KYSH_OL_MAT = "kysh_ol_mat"
+_KYSH_OL_THICKNESS = 0.075
+_KYSH_OL_FACE_THICKNESS = 0.001
 
 
 #lil helpers
@@ -192,6 +208,44 @@ def _kysh_set_input(mat, socket_name, value):
                     inp.default_value = value
                 except (TypeError, AttributeError, ValueError):
                     continue
+
+
+def _kysh_set_premul(img):
+    if img is None:
+        return
+    try:
+        img.alpha_mode = 'PREMUL'
+    except (TypeError, AttributeError):
+        pass
+
+
+def _kysh_mat_tree(mat):
+    try:
+        if not mat.use_nodes:
+            mat.use_nodes = True
+    except AttributeError:
+        pass
+    return mat.node_tree
+
+
+def _kysh_find_lightmap_image(mat):
+    if mat is None or mat.node_tree is None:
+        return None
+    stack = [mat.node_tree]
+    seen = set()
+    while stack:
+        tree = stack.pop()
+        if tree.name in seen:
+            continue
+        seen.add(tree.name)
+        for n in tree.nodes:
+            if n.type == 'TEX_IMAGE' and n.image is not None:
+                key = (n.name + n.label + n.image.name).lower().replace(" ", "").replace("_", "")
+                if "lightmap" in key and "outline" not in key:
+                    return n.image
+            elif n.type == 'GROUP' and n.node_tree is not None:
+                stack.append(n.node_tree)
+    return None
 
 
 def _kysh_set_colorspace(img, suffix):
@@ -322,6 +376,7 @@ def _kysh_build_face(src, face_img, name=None, lightmap_img=None):
     if node is not None:
         if face_img is not None:
             _kysh_set_colorspace(face_img, "_D")
+            _kysh_set_premul(face_img)
             node.image = face_img
         group = _kysh_find_group(new_mat)
         _kysh_link(new_mat, node, "_D Map", group)
@@ -371,6 +426,42 @@ def _kysh_fix_eye_transparent(mat):
     return False
 
 
+def _kysh_eye_shadow_material(face_img):
+    for m in bpy.data.materials:
+        if m.get(_KYSH_ROLE) != "eye_shadow" or m.node_tree is None:
+            continue
+        tex = next((n for n in m.node_tree.nodes if n.type == 'TEX_IMAGE'), None)
+        if tex is not None and tex.image == face_img:
+            return m
+    mat = bpy.data.materials.new(_KYSH_EYE_SHADOW)
+    mat[_KYSH_ROLE] = "eye_shadow"
+    nt = _kysh_mat_tree(mat)
+    nt.nodes.clear()
+    tex = _kysh_new_node(nt, 'ShaderNodeTexImage', (-500, 0))
+    tex.name = tex.label = "Face_D"
+    tex.image = face_img
+    bsdf = _kysh_new_node(nt, 'ShaderNodeBsdfTransparent', (-150, 0))
+    out = _kysh_new_node(nt, 'ShaderNodeOutputMaterial', (100, 0))
+    nt.links.new(tex.outputs["Color"], bsdf.inputs["Color"])
+    nt.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+    try:
+        mat.surface_render_method = 'BLENDED'
+    except (AttributeError, TypeError):
+        pass
+    return mat
+
+
+def _kysh_object_face_image(obj):
+    for slot in obj.material_slots:
+        m = slot.material
+        if m is None or m.get(_KYSH_ROLE):
+            continue
+        img = _kysh_image_from_node(m, "Face_D") or _kysh_find_map_image(m, "Face_D")
+        if img is not None:
+            return img
+    return None
+
+
 #raw zzz fbx support, the MAT_ name _UI mats and the Materials json files
 
 def _kysh_is_kythera(mat):
@@ -379,6 +470,8 @@ def _kysh_is_kythera(mat):
 
 
 def _kysh_is_raw(mat):
+    if mat.get(_KYSH_ROLE):
+        return False
     base = _kysh_strip_dup(mat.name)
     if _kysh_is_kythera(mat) or base in _KYSH_BODY_MATERIALS or base in (_KYSH_FACE_MATERIAL, _KYSH_EYE_TRANSPARENT):
         return False
@@ -424,6 +517,19 @@ def _kysh_find_texture_file(dirs, tex_name):
             p = os.path.join(d, stem + ext)
             if os.path.isfile(p):
                 return p
+    return None
+
+
+def _kysh_find_lightmap_file(dirs):
+    for d in dirs:
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for fn in names:
+            low = fn.lower()
+            if "face_lightmap" in low and low.endswith(_KYSH_IMG_EXTS):
+                return os.path.join(d, fn)
     return None
 
 
@@ -490,10 +596,11 @@ def _kysh_classify_raw(mat, shader):
     base = _kysh_strip_dup(mat.name).lower()
     s = shader.lower()
     if "shadowcaster" in s or "stencilshadow" in s or "hairshadow" in base:
-        return _K_HIDE
-    #outlines get yeeted, we got no inverted hull here sry
+        return _K_DELETE
     if "outline" in s or "outline" in base:
         return _K_HIDE
+    if s.endswith("eye") or (not s and (base.endswith("_eye") or base.endswith("_eye_ui"))):
+        return _K_EYE
     if "uiface" in s or s.endswith("face") or "_face" in base or "eyebrow" in base or "brow" in base:
         return _K_FACE
     return _K_BODY
@@ -541,6 +648,8 @@ def _kysh_raw_images(mat, folder):
                     if img is not None:
                         images[suffix] = img
 
+    if kind == _K_FACE and lightmap is None:
+        lightmap = _kysh_load_image(_kysh_find_lightmap_file(dirs))
     if kind == _K_BODY and images.get("_D") is None:
         kind = _K_SKIP
     return kind, images, lightmap
@@ -835,12 +944,356 @@ def _kysh_setup_face_object(context, obj, sun):
             obj.modifiers.move(list(obj.modifiers).index(mod), len(obj.modifiers) - 1)
     except (AttributeError, RuntimeError):
         pass
+    _kysh_ol_to_end(obj)
     obj.update_tag()
     return mod
 
 
 def _kysh_material_is_face(mat):
     return mat is not None and mat.name.startswith(_KYSH_FACE_PREFIX)
+
+def _kysh_ol_image(mat):
+    for nm in ("Body_D", "Face_D"):
+        img = _kysh_image_from_node(mat, nm)
+        if img is not None:
+            return img
+    return _kysh_find_map_image(mat, "_D")
+
+
+def _kysh_ol_finish(mat):
+    try:
+        mat.surface_render_method = 'DITHERED'
+    except (AttributeError, TypeError):
+        pass
+    mat.use_backface_culling = True
+    try:
+        mat.use_backface_culling_shadow = True
+    except AttributeError:
+        pass
+
+
+def _kysh_ol_hidden_material():
+    mat = bpy.data.materials.get(_KYSH_OL_HIDDEN)
+    if mat is not None:
+        return mat
+    mat = bpy.data.materials.new(_KYSH_OL_HIDDEN)
+    mat[_KYSH_ROLE] = "outline"
+    nt = _kysh_mat_tree(mat)
+    nt.nodes.clear()
+    tr = _kysh_new_node(nt, 'ShaderNodeBsdfTransparent', (-150, 0))
+    out = _kysh_new_node(nt, 'ShaderNodeOutputMaterial', (100, 0))
+    nt.links.new(tr.outputs[0], out.inputs["Surface"])
+    _kysh_ol_finish(mat)
+    return mat
+
+
+def _kysh_ol_material(src):
+    name = src.name + _KYSH_OL_SUFFIX
+    mat = bpy.data.materials.get(name)
+    if mat is not None and mat.get(_KYSH_ROLE) == "outline":
+        return mat
+    img = _kysh_ol_image(src)
+    mat = bpy.data.materials.new(name)
+    mat[_KYSH_ROLE] = "outline"
+    nt = _kysh_mat_tree(mat)
+    nt.nodes.clear()
+    tex = _kysh_new_node(nt, 'ShaderNodeTexImage', (-750, 0))
+    tex.name = tex.label = "Outline_Diffuse"
+    tex.image = img
+    hsv = _kysh_new_node(nt, 'ShaderNodeHueSaturation', (-450, 0))
+    hsv.inputs[0].default_value = 0.5
+    hsv.inputs[1].default_value = 3.0 if _kysh_material_is_face(src) else 1.2
+    hsv.inputs[2].default_value = 0.4
+    hsv.inputs[3].default_value = 1.0
+    hsv.inputs[4].default_value = (0.1, 0.1, 0.1, 1.0)
+    if img is not None:
+        nt.links.new(tex.outputs["Color"], hsv.inputs[4])
+    emit = _kysh_new_node(nt, 'ShaderNodeEmission', (-200, 0))
+    nt.links.new(hsv.outputs[0], emit.inputs["Color"])
+    lp = _kysh_new_node(nt, 'ShaderNodeLightPath', (-200, 350))
+    tr = _kysh_new_node(nt, 'ShaderNodeBsdfTransparent', (-200, -150))
+    mix = _kysh_new_node(nt, 'ShaderNodeMixShader', (50, 0))
+    nt.links.new(lp.outputs["Is Shadow Ray"], mix.inputs[0])
+    nt.links.new(emit.outputs[0], mix.inputs[1])
+    nt.links.new(tr.outputs[0], mix.inputs[2])
+    out = _kysh_new_node(nt, 'ShaderNodeOutputMaterial', (250, 0))
+    nt.links.new(mix.outputs[0], out.inputs["Surface"])
+    _kysh_ol_finish(mat)
+    return mat
+
+
+def _kysh_ol_skip(mat):
+    if mat is None:
+        return True
+    role = mat.get(_KYSH_ROLE)
+    if role:
+        return True
+    return _kysh_strip_dup(mat.name) in (_KYSH_EYE_SHADOW, _KYSH_EYE_TRANSPARENT)
+
+
+def _kysh_ol_strip_slots(obj):
+    mats = obj.data.materials
+    for i in reversed(range(len(mats))):
+        m = mats[i]
+        if m is not None and m.get(_KYSH_ROLE) == "outline":
+            mats.pop(index=i)
+
+
+def _kysh_set_attr(me, name, dtype, domain, values):
+    a = me.attributes.get(name)
+    if a is not None and (a.data_type != dtype or a.domain != domain):
+        me.attributes.remove(a)
+        a = None
+    if a is None:
+        a = me.attributes.new(name, dtype, domain)
+    a.data.foreach_set("value", values)
+
+
+def _kysh_ol_prepare(obj):
+    _kysh_ol_strip_slots(obj)
+    me = obj.data
+    mats = me.materials
+    n = len(mats)
+    lut = []
+    for i in range(n):
+        m = mats[i]
+        if _kysh_ol_skip(m):
+            mats.append(_kysh_ol_hidden_material())
+            lut.append(-1)
+        else:
+            mats.append(_kysh_ol_material(m))
+            lut.append(n + i)
+    if not lut:
+        lut = [-1]
+    nv = len(me.vertices)
+    co = np.empty(nv * 3, dtype=np.float32)
+    me.vertices.foreach_get("co", co)
+    key = np.round(co.reshape(-1, 3) * 100000.0).astype(np.int64)
+    _u, inv = np.unique(key, axis=0, return_inverse=True)
+    inv = inv.reshape(-1).astype(np.int32)
+    width = np.ones(nv, dtype=np.float32)
+    cols = me.color_attributes
+    ca = cols.active_color if cols.active_color is not None else (cols[0] if len(cols) else None)
+    if ca is not None and len(ca.data):
+        raw = np.empty(len(ca.data) * 4, dtype=np.float32)
+        ca.data.foreach_get("color_srgb" if ca.data_type == 'BYTE_COLOR' else "color", raw)
+        red = np.clip(raw[0::4] * 2.0, 0.0, 2.0)
+        if ca.domain == 'CORNER':
+            vi = np.empty(len(me.loops), dtype=np.int32)
+            me.loops.foreach_get("vertex_index", vi)
+            tot = np.bincount(vi, weights=red, minlength=nv)
+            cnt = np.bincount(vi, minlength=nv)
+            width = (tot / np.maximum(cnt, 1)).astype(np.float32)
+        else:
+            width = red.astype(np.float32)
+        gmax = np.zeros(int(inv.max()) + 1 if nv else 1, dtype=np.float32)
+        np.maximum.at(gmax, inv, width)
+        width = gmax[inv]
+    mi = np.empty(len(me.polygons), dtype=np.int32)
+    me.polygons.foreach_get("material_index", mi)
+    lut = np.array(lut, dtype=np.int32)
+    olm = lut[np.clip(mi, 0, len(lut) - 1)]
+    _kysh_set_attr(me, _KYSH_OL_WELD, 'INT', 'POINT', inv)
+    _kysh_set_attr(me, _KYSH_OL_WIDTH, 'FLOAT', 'POINT', width)
+    _kysh_set_attr(me, _KYSH_OL_MAT, 'INT', 'FACE', olm)
+    me.update()
+    return n
+
+
+def _kysh_ol_new_group(name):
+    g = bpy.data.node_groups.new(name, 'GeometryNodeTree')
+    iface = g.interface
+    iface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
+    th = iface.new_socket("Thickness", in_out='INPUT', socket_type='NodeSocketFloat')
+    th.default_value = _KYSH_OL_THICKNESS
+    th.min_value = 0.0
+    iface.new_socket("Screen Space", in_out='INPUT', socket_type='NodeSocketBool')
+    iface.new_socket("Camera", in_out='INPUT', socket_type='NodeSocketObject')
+    iface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
+    gin = _kysh_new_node(g, 'NodeGroupInput', (-1400, 0))
+    gout = _kysh_new_node(g, 'NodeGroupOutput', (900, 0))
+    return g, gin, gout
+
+
+def _kysh_ol_named(g, name, dtype, loc):
+    n = _kysh_new_node(g, 'GeometryNodeInputNamedAttribute', loc)
+    n.data_type = dtype
+    n.inputs["Name"].default_value = name
+    return n
+
+
+def _kysh_ol_tail(g, gin, gout, geo_socket, dir_socket):
+    width = _kysh_ol_named(g, _KYSH_OL_WIDTH, 'FLOAT', (-900, -300))
+    m1 = _kysh_new_node(g, 'ShaderNodeMath', (-700, -200))
+    m1.operation = 'MULTIPLY'
+    g.links.new(gin.outputs["Thickness"], m1.inputs[0])
+    m1.inputs[1].default_value = 0.01
+    m2 = _kysh_new_node(g, 'ShaderNodeMath', (-500, -200))
+    m2.operation = 'MULTIPLY'
+    g.links.new(m1.outputs[0], m2.inputs[0])
+    g.links.new(width.outputs["Attribute"], m2.inputs[1])
+    cam = _kysh_new_node(g, 'GeometryNodeObjectInfo', (-900, -550))
+    cam.transform_space = 'RELATIVE'
+    g.links.new(gin.outputs["Camera"], cam.inputs["Object"])
+    pos = _kysh_new_node(g, 'GeometryNodeInputPosition', (-900, -750))
+    dist = _kysh_new_node(g, 'ShaderNodeVectorMath', (-700, -600))
+    dist.operation = 'DISTANCE'
+    g.links.new(pos.outputs[0], dist.inputs[0])
+    g.links.new(cam.outputs["Location"], dist.inputs[1])
+    sw = _kysh_new_node(g, 'GeometryNodeSwitch', (-500, -450))
+    sw.input_type = 'FLOAT'
+    g.links.new(gin.outputs["Screen Space"], sw.inputs["Switch"])
+    sw.inputs["False"].default_value = 1.0
+    g.links.new(dist.outputs["Value"], sw.inputs["True"])
+    m3 = _kysh_new_node(g, 'ShaderNodeMath', (-300, -250))
+    m3.operation = 'MULTIPLY'
+    g.links.new(m2.outputs[0], m3.inputs[0])
+    g.links.new(sw.outputs[0], m3.inputs[1])
+    scl = _kysh_new_node(g, 'ShaderNodeVectorMath', (-100, -100))
+    scl.operation = 'SCALE'
+    g.links.new(dir_socket, scl.inputs[0])
+    g.links.new(m3.outputs[0], scl.inputs["Scale"])
+    setp = _kysh_new_node(g, 'GeometryNodeSetPosition', (100, 0))
+    g.links.new(geo_socket, setp.inputs["Geometry"])
+    g.links.new(scl.outputs[0], setp.inputs["Offset"])
+    olm = _kysh_ol_named(g, _KYSH_OL_MAT, 'INT', (100, -300))
+    lt = _kysh_new_node(g, 'ShaderNodeMath', (300, -250))
+    lt.operation = 'LESS_THAN'
+    g.links.new(olm.outputs["Attribute"], lt.inputs[0])
+    lt.inputs[1].default_value = 0.0
+    dele = _kysh_new_node(g, 'GeometryNodeDeleteGeometry', (300, 0))
+    dele.domain = 'FACE'
+    g.links.new(setp.outputs[0], dele.inputs["Geometry"])
+    g.links.new(lt.outputs[0], dele.inputs["Selection"])
+    smi = _kysh_new_node(g, 'GeometryNodeSetMaterialIndex', (500, 0))
+    g.links.new(dele.outputs[0], smi.inputs["Geometry"])
+    g.links.new(olm.outputs["Attribute"], smi.inputs["Material Index"])
+    flip = _kysh_new_node(g, 'GeometryNodeFlipFaces', (650, 0))
+    g.links.new(smi.outputs[0], flip.inputs[0])
+    inst = _kysh_new_node(g, 'GeometryNodeGeometryToInstance', (800, 100))
+    g.links.new(gin.outputs["Geometry"], inst.inputs[0])
+    g.links.new(flip.outputs[0], inst.inputs[0])
+    g.links.new(inst.outputs[0], gout.inputs["Geometry"])
+
+
+def _kysh_ensure_ol_gn():
+    g = bpy.data.node_groups.get(_KYSH_OL_GN)
+    if g is not None and g.bl_idname == 'GeometryNodeTree':
+        return g
+    g, gin, gout = _kysh_ol_new_group(_KYSH_OL_GN)
+    merge = _kysh_new_node(g, 'GeometryNodeMergeByDistance', (-1100, 200))
+    g.links.new(gin.outputs["Geometry"], merge.inputs["Geometry"])
+    merge.inputs["Distance"].default_value = 0.0001
+    nrm = _kysh_new_node(g, 'GeometryNodeInputNormal', (-900, 0))
+    _kysh_ol_tail(g, gin, gout, merge.outputs["Geometry"], nrm.outputs["Normal"])
+    return g
+
+
+def _kysh_ensure_ol_fast_gn():
+    g = bpy.data.node_groups.get(_KYSH_OL_FAST_GN)
+    if g is not None and g.bl_idname == 'GeometryNodeTree':
+        return g
+    g, gin, gout = _kysh_ol_new_group(_KYSH_OL_FAST_GN)
+    nrm = _kysh_new_node(g, 'GeometryNodeInputNormal', (-1100, 0))
+    weld = _kysh_ol_named(g, _KYSH_OL_WELD, 'INT', (-1100, -150))
+    acc = _kysh_new_node(g, 'GeometryNodeAccumulateField', (-900, 0))
+    acc.data_type = 'FLOAT_VECTOR'
+    acc.domain = 'POINT'
+    g.links.new(nrm.outputs["Normal"], acc.inputs[0])
+    g.links.new(weld.outputs["Attribute"], acc.inputs[1])
+    norm = _kysh_new_node(g, 'ShaderNodeVectorMath', (-700, 0))
+    norm.operation = 'NORMALIZE'
+    g.links.new(acc.outputs["Total"], norm.inputs[0])
+    _kysh_ol_tail(g, gin, gout, gin.outputs["Geometry"], norm.outputs["Vector"])
+    return g
+
+
+def _kysh_ol_is_mod(m):
+    if m.type == 'NODES':
+        return m.name == _KYSH_OL_MOD or (m.node_group is not None and m.node_group.name.startswith(_KYSH_OL_GN))
+    return m.type == 'SOLIDIFY' and m.name == _KYSH_OL_FACE_MOD
+
+
+def _kysh_ol_remove(obj):
+    for m in list(obj.modifiers):
+        if _kysh_ol_is_mod(m):
+            obj.modifiers.remove(m)
+    _kysh_ol_strip_slots(obj)
+    me = obj.data
+    for nm in (_KYSH_OL_WELD, _KYSH_OL_WIDTH, _KYSH_OL_MAT):
+        a = me.attributes.get(nm)
+        if a is not None:
+            me.attributes.remove(a)
+
+
+def _kysh_ol_to_end(obj):
+    for m in [m for m in obj.modifiers if _kysh_ol_is_mod(m)]:
+        try:
+            obj.modifiers.move(list(obj.modifiers).index(m), len(obj.modifiers) - 1)
+        except (AttributeError, RuntimeError, ValueError):
+            pass
+
+
+def _kysh_ol_sync(scn):
+    scale = scn.kythera_outline_thickness / _KYSH_OL_THICKNESS
+    for obj in scn.objects:
+        for m in obj.modifiers:
+            if not _kysh_ol_is_mod(m):
+                continue
+            m.show_viewport = scn.kythera_outline_viewport
+            if m.type == 'SOLIDIFY':
+                m.thickness = _KYSH_OL_FACE_THICKNESS * scale
+                continue
+            g = m.node_group
+            if g is None:
+                continue
+            _kysh_mod_set_input(m, _kysh_iface_id(g, "Thickness", 'INPUT'), scn.kythera_outline_thickness)
+            _kysh_mod_set_input(m, _kysh_iface_id(g, "Screen Space", 'INPUT'), scn.kythera_outline_screen_space)
+            _kysh_mod_set_input(m, _kysh_iface_id(g, "Camera", 'INPUT'), scn.camera)
+            obj.update_tag()
+
+
+def _kysh_ol_update(self, context):
+    _kysh_ol_sync(context.scene)
+
+
+def _kysh_ol_targets(context):
+    out = []
+    for obj in _kysh_targets(context):
+        if any(s.material is not None and _kysh_is_kythera(s.material) for s in obj.material_slots):
+            out.append(obj)
+    return out
+
+
+def _kysh_add_outlines(context, fast):
+    group = _kysh_ensure_ol_fast_gn() if fast else _kysh_ensure_ol_gn()
+    done = 0
+    for obj in _kysh_ol_targets(context):
+        _kysh_ol_remove(obj)
+        for m in obj.modifiers:
+            if m.name.startswith("Outlines") and (m.type == 'SOLIDIFY' or (
+                    m.type == 'NODES' and m.node_group is not None and m.node_group.name.startswith("ZZZ Outlines"))):
+                m.show_viewport = False
+                m.show_render = False
+        n = _kysh_ol_prepare(obj)
+        is_face = any(_kysh_material_is_face(s.material) for s in obj.material_slots)
+        if is_face and not fast:
+            mod = obj.modifiers.new(_KYSH_OL_FACE_MOD, 'SOLIDIFY')
+            mod.offset = 1.0
+            mod.use_flip_normals = True
+            mod.use_even_offset = False
+            mod.use_quality_normals = False
+            mod.use_rim = False
+            mod.material_offset = n
+        else:
+            mod = obj.modifiers.new(_KYSH_OL_MOD, 'NODES')
+            mod.node_group = group
+        _kysh_ol_to_end(obj)
+        done += 1
+    _kysh_ol_sync(context.scene)
+    return done
+
+
 
 
 # conversion
@@ -849,6 +1302,7 @@ def _kysh_convert_object(obj, body_src, face_src, cache, raw_folder=None):
     count = 0
     has_face = False
     hide = 0
+    delete = 0
     for slot in obj.material_slots:
         mat = slot.material
         if mat is None:
@@ -858,7 +1312,11 @@ def _kysh_convert_object(obj, body_src, face_src, cache, raw_folder=None):
             continue
         if mat in cache:
             new = cache[mat]
-            if new is not None:
+            if new == _K_DELETE:
+                delete += 1
+            elif new == _K_HIDE:
+                hide += 1
+            elif new is not None:
                 slot.material = new
                 count += 1
                 if _kysh_material_is_face(new):
@@ -870,45 +1328,73 @@ def _kysh_convert_object(obj, body_src, face_src, cache, raw_folder=None):
             images = {sfx: _kysh_find_map_image(mat, sfx) for sfx, _n, _s in _KYSH_BODY_MAPS}
             new = _kysh_build_body(body_src, images, body_src.name + _KYSH_BODY_MATERIALS[base])
         elif base == _KYSH_FACE_MATERIAL and face_src is not None:
-            new = _kysh_build_face(face_src, _kysh_image_from_node(mat, "Face_D") or _kysh_find_map_image(mat, "_D"))
+            lightmap = _kysh_find_lightmap_image(mat)
+            if lightmap is None:
+                lightmap = _kysh_load_image(_kysh_find_lightmap_file(_kysh_search_dirs(_kysh_material_dir(mat))))
+            new = _kysh_build_face(face_src, _kysh_image_from_node(mat, "Face_D") or _kysh_find_map_image(mat, "_D"),
+                                   lightmap_img=lightmap)
         elif base == _KYSH_EYE_TRANSPARENT:
-            if _kysh_fix_eye_transparent(mat):
-                count += 1
-            cache[mat] = None
-            continue
+            new = _kysh_eye_shadow_material(_kysh_object_face_image(obj))
         elif _kysh_is_raw(mat):
             folder = _kysh_material_dir(mat) or raw_folder
             kind, images, lightmap = _kysh_raw_images(mat, folder)
             label = " (%s)" % _kysh_pretty(mat.name)
             if kind == _K_FACE and face_src is not None:
                 new = _kysh_build_face(face_src, images.get("_D"), face_src.name + label, lightmap)
+            elif kind == _K_EYE:
+                new = _kysh_eye_shadow_material(images.get("_D"))
             elif kind == _K_BODY and body_src is not None:
                 new = _kysh_build_body(body_src, images, body_src.name + label)
             elif kind == _K_HIDE:
                 hide += 1
+                new = _K_HIDE
+            elif kind == _K_DELETE:
+                delete += 1
+                new = _K_DELETE
         cache[mat] = new
-        if new is not None:
+        if new is not None and not isinstance(new, str):
             slot.material = new
             count += 1
             if _kysh_material_is_face(new):
                 has_face = True
-    if hide and hide == len([s for s in obj.material_slots if s.material is not None]):
-        #like the HairShadow stencil meshes, only useful ingame so hide em lmao
-        # out of sight out of mind
+    used = len([s for s in obj.material_slots if s.material is not None])
+    doomed = "hairshadow" in obj.name.lower() or (delete and delete + hide == used)
+    if not doomed and hide and hide == used:
         obj.hide_set(True)
         obj.hide_render = True
-    return count, has_face
+    return count, has_face, doomed
+
+
+def _kysh_delete_objects(objs):
+    removed = 0
+    for obj in objs:
+        try:
+            data = obj.data
+            bpy.data.objects.remove(obj, do_unlink=True)
+        except ReferenceError:
+            continue
+        removed += 1
+        try:
+            if data is not None and data.users == 0 and isinstance(data, bpy.types.Mesh):
+                bpy.data.meshes.remove(data)
+        except ReferenceError:
+            pass
+    return removed
 
 
 def _kysh_convert_targets(context, objs, body_src, face_src, raw_folder=None):
     total = 0
     cache = {}
     face_objs = []
+    doomed = []
     for obj in objs:
-        n, has_face = _kysh_convert_object(obj, body_src, face_src, cache, raw_folder)
+        n, has_face, kill = _kysh_convert_object(obj, body_src, face_src, cache, raw_folder)
         total += n
-        if has_face:
+        if kill:
+            doomed.append(obj)
+        elif has_face:
             face_objs.append(obj)
+    _kysh_delete_objects(doomed)
     if face_objs or total:
         sun = _kysh_ensure_sun(context)
         for obj in face_objs:
@@ -1086,6 +1572,46 @@ class JIDEEH_OT_kythera_setup_face(Operator):
                 n += 1
         self.report({'INFO'}, "Face vectors set up on %d object(s)" % n)
         return {'FINISHED'}
+
+class JIDEEH_OT_kythera_add_outlines(Operator):
+    bl_idname = "jideeh.kythera_add_outlines"
+    bl_label = "Add Outlines"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    fast: BoolProperty(name="Fast", default=False)
+
+    @classmethod
+    def description(cls, context, props):
+        if props.fast:
+            return ("Inverted-hull outlines on every converted mesh with a lightweight Geometry Nodes setup. "
+                    "Seams are welded once at setup instead of every frame, so posing and playback stay smooth")
+        return ("Inverted-hull outlines like the HoYoverse Setup Wizard: Geometry Nodes with Merge by Distance "
+                "on body meshes and a Solidify modifier on the face")
+
+    def execute(self, context):
+        n = _kysh_add_outlines(context, self.fast)
+        self.report({'INFO'}, "Added outlines to %d object(s)" % n)
+        return {'FINISHED'}
+
+
+class JIDEEH_OT_kythera_remove_outlines(Operator):
+    bl_idname = "jideeh.kythera_remove_outlines"
+    bl_label = "Remove Outlines"
+    bl_description = "Remove the outline modifiers and outline material slots from every mesh"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        n = 0
+        for obj in _kysh_targets(context):
+            if any(_kysh_ol_is_mod(m) for m in obj.modifiers):
+                n += 1
+            _kysh_ol_remove(obj)
+        for mat in list(bpy.data.materials):
+            if mat.get(_KYSH_ROLE) == "outline" and mat.users == 0:
+                bpy.data.materials.remove(mat)
+        self.report({'INFO'}, "Removed outlines from %d object(s)" % n)
+        return {'FINISHED'}
+
 
 class JIDEEH_OT_kythera_clear_cache(Operator):
     bl_idname = "jideeh.kythera_clear_cache"
@@ -1611,6 +2137,19 @@ class JIDEEH_PT_kythera_shader(Panel):
                 box.prop(sun.data, "energy")
             box.operator("jideeh.kythera_setup_face", icon='FACESEL')
 
+        box, expanded = _kysh_draw_subpanel(menu, scn, "kythera_shader_show_outlines", "Outlines", 'MOD_SOLIDIFY')
+        if expanded:
+            col = box.column(align=True)
+            op = col.operator("jideeh.kythera_add_outlines", text="Add Outlines", icon='MOD_SOLIDIFY')
+            op.fast = False
+            op = col.operator("jideeh.kythera_add_outlines", text="Add Fast Outlines", icon='FF')
+            op.fast = True
+            col.operator("jideeh.kythera_remove_outlines", icon='X')
+            box.prop(scn, "kythera_outline_thickness", text="Thickness")
+            row = box.row(align=True)
+            row.prop(scn, "kythera_outline_screen_space", text="Screen Space", toggle=True)
+            row.prop(scn, "kythera_outline_viewport", text="Viewport", toggle=True, icon='RESTRICT_VIEW_OFF')
+
         box, expanded = _kysh_draw_subpanel(menu, scn, "kythera_shader_show_tools", "Tools", 'TOOL_SETTINGS')
         if expanded:
             tools = box.column(align=True)
@@ -1637,6 +2176,8 @@ _KYSH_CLASSES = (
     JIDEEH_OT_kythera_import_fbx,
     JIDEEH_OT_kythera_reapply,
     JIDEEH_OT_kythera_setup_face,
+    JIDEEH_OT_kythera_add_outlines,
+    JIDEEH_OT_kythera_remove_outlines,
     JIDEEH_OT_kythera_clear_cache,
     JIDEEH_OT_kythera_select_unconverted,
     JIDEEH_OT_kythera_purge_old,
@@ -1686,6 +2227,31 @@ def register():
         name="Updates",
         default=False,
     )
+    bpy.types.Scene.kythera_shader_show_outlines = BoolProperty(
+        name="Outlines",
+        default=True,
+    )
+    bpy.types.Scene.kythera_outline_thickness = FloatProperty(
+        name="Outline Thickness",
+        default=_KYSH_OL_THICKNESS,
+        min=0.0,
+        soft_max=0.5,
+        step=0.5,
+        precision=3,
+        update=_kysh_ol_update,
+    )
+    bpy.types.Scene.kythera_outline_screen_space = BoolProperty(
+        name="Screen Space",
+        description="Scale outline width by distance to the scene camera so it stays the same size on screen",
+        default=False,
+        update=_kysh_ol_update,
+    )
+    bpy.types.Scene.kythera_outline_viewport = BoolProperty(
+        name="Show Outlines In Viewport",
+        description="Turn off to hide outlines in the viewport while posing, they still render",
+        default=True,
+        update=_kysh_ol_update,
+    )
     for cls in _KYSH_CLASSES:
         bpy.utils.register_class(cls)
     #delay it so prefs r loaded b4 we read em
@@ -1699,6 +2265,10 @@ def unregister():
         bpy.app.timers.unregister(_kysh_redraw_while_busy)
     for cls in reversed(_KYSH_CLASSES):
         bpy.utils.unregister_class(cls)
+    del bpy.types.Scene.kythera_outline_viewport
+    del bpy.types.Scene.kythera_outline_screen_space
+    del bpy.types.Scene.kythera_outline_thickness
+    del bpy.types.Scene.kythera_shader_show_outlines
     del bpy.types.Scene.kythera_shader_show_update
     del bpy.types.Scene.kythera_sun
     del bpy.types.Scene.kythera_shader_show_light
