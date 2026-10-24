@@ -98,6 +98,8 @@ _KYSH_OL_MAT = "kysh_ol_mat"
 _KYSH_OL_THICKNESS = 0.075
 _KYSH_OL_FACE_THICKNESS = 0.001
 _KYSH_OL_MASTER = "kysh_ol_master"
+_KYSH_OL_VGROUP = "Kythera Outline Width"
+_KYSH_EYE_TAG = "kysh_eye"
 
 
 #lil helpers
@@ -488,33 +490,30 @@ def _kysh_eye_hl_material(face_img):
         if tex is not None:
             tex.image = face_img
         return mat
-    mat = bpy.data.materials.new(_KYSH_EYE_HL)
-    mat[_KYSH_ROLE] = "eye_highlight"
-    nt = _kysh_mat_tree(mat)
-    nt.nodes.clear()
-    tex = _kysh_new_node(nt, 'ShaderNodeTexImage', (-1000, 650))
-    tex.name = tex.label = "Face_D"
-    tex.image = face_img
-    tr = _kysh_new_node(nt, 'ShaderNodeBsdfTransparent', (-689, 765))
-    tr.inputs[0].default_value = (1.0, 1.0, 1.0, 1.0)
-    ramp = _kysh_new_node(nt, 'ShaderNodeValToRGB', (-645, 561))
-    els = ramp.color_ramp.elements
-    els[0].position = 0.0
-    els[0].color = (0.0, 0.0, 0.0, 1.0)
-    els[-1].position = 1.0
-    els[-1].color = (0.333505, 0.333505, 0.333505, 1.0)
-    mix = _kysh_new_node(nt, 'ShaderNodeMixShader', (-257, 746))
-    out = _kysh_new_node(nt, 'ShaderNodeOutputMaterial', (13, 883))
-    nt.links.new(tex.outputs["Alpha"], ramp.inputs[0])
-    nt.links.new(ramp.outputs[0], mix.inputs[0])
-    nt.links.new(tr.outputs[0], mix.inputs[1])
-    nt.links.new(tex.outputs["Color"], mix.inputs[2])
-    nt.links.new(mix.outputs[0], out.inputs["Surface"])
+    return None
+
+
+def _kysh_eye_hl_source():
+    src = _KYSH_SRC.get("eye_hl")
     try:
-        mat.surface_render_method = 'BLENDED'
-    except (AttributeError, TypeError):
-        pass
-    return mat
+        if src is not None:
+            src.name
+    except ReferenceError:
+        src = None
+    return src
+
+
+def _kysh_eye_fallback_material(obj):
+    face = None
+    for slot in obj.material_slots:
+        m = slot.material
+        if m is None or m.get(_KYSH_ROLE) or not _kysh_material_is_face(m):
+            continue
+        if m.get(_KYSH_EYE_TAG):
+            return m
+        if face is None:
+            face = m
+    return face
 
 
 def _kysh_eye_masks(me):
@@ -533,7 +532,7 @@ def _kysh_eye_masks(me):
     r = np.rint(raw[:, 0] * 255.0)
     g = np.rint(raw[:, 1] * 255.0)
     shadow = (r >= 1) & (r <= 2) & (g == 0)
-    hl = (r == 0) & (g == 3)
+    hl = ((r == 0) & (g == 3)) | ((r == 3) & (g == 4))
     starts = np.empty(len(me.polygons), dtype=np.int32)
     me.polygons.foreach_get("loop_start", starts)
     return np.logical_and.reduceat(shadow, starts), np.logical_and.reduceat(hl, starts)
@@ -556,6 +555,10 @@ def _kysh_split_eyes(obj):
     face_img = _kysh_object_face_image(obj)
     allowed = np.array([m is not None and (_kysh_material_is_face(m) or m.get(_KYSH_ROLE) in ("eye_shadow", "eye_highlight"))
                         for m in me.materials] or [False], dtype=bool)
+    tagged = np.array([m is not None and (bool(m.get(_KYSH_EYE_TAG)) or m.get(_KYSH_ROLE) in ("eye_shadow", "eye_highlight"))
+                       for m in me.materials] or [False], dtype=bool)
+    if tagged.any():
+        allowed = tagged
     mi = np.empty(len(me.polygons), dtype=np.int32)
     me.polygons.foreach_get("material_index", mi)
     ok = allowed[np.clip(mi, 0, len(allowed) - 1)]
@@ -563,7 +566,10 @@ def _kysh_split_eyes(obj):
     for mask, maker in ((shadow & ok, _kysh_eye_shadow_material), (hl & ok, _kysh_eye_hl_material)):
         if not mask.any():
             continue
-        idx = _kysh_slot_for(obj, maker(face_img))
+        target = maker(face_img) or _kysh_eye_fallback_material(obj)
+        if target is None:
+            continue
+        idx = _kysh_slot_for(obj, target)
         mi[mask] = idx
         changed += int(mask.sum())
     if changed:
@@ -741,13 +747,20 @@ def _kysh_raw_images(mat, folder):
             name = tex.get(slot)
             if not name:
                 continue
-            img = _kysh_load_image(_kysh_find_texture_file(dirs, name))
+            img = _kysh_load_image(_kysh_find_texture_file(dirs, name)) or _kysh_image_by_stem(os.path.splitext(name)[0], mat)
             if img is None:
                 continue
             if kind in (_K_FACE, _K_EYE) and slot == "_LightTex":
                 lightmap = img
             else:
                 images[suffix] = img
+    for slot, img in _kysh_node_slot_images(mat).items():
+        suffix = _KYSH_JSON_SLOTS[slot]
+        if kind in (_K_FACE, _K_EYE) and slot == "_LightTex":
+            if lightmap is None:
+                lightmap = img
+        elif suffix not in images:
+            images[suffix] = img
 
     # fallback, just go off the _D the importer loaded tbh
     d_img = images.get("_D") or _kysh_find_map_image(mat, "_D")
@@ -759,21 +772,89 @@ def _kysh_raw_images(mat, folder):
     if d_img is not None and "_D" not in images:
         path = bpy.path.abspath(d_img.filepath) if d_img.filepath else ""
         images["_D"] = _kysh_load_image(path) if os.path.isfile(path) else d_img
-    if images.get("_D") is not None and kind == _K_BODY:
-        stem = _kysh_img_base(images["_D"])
-        if stem.endswith("_D"):
-            stem = stem[:-2]
-            for suffix in ("_M", "_A", "_N"):
-                if suffix not in images:
-                    img = _kysh_load_image(_kysh_find_texture_file(dirs, stem + suffix))
-                    if img is not None:
-                        images[suffix] = img
+    if kind == _K_BODY:
+        _kysh_fill_siblings(images, mat, folder)
 
     if kind in (_K_FACE, _K_EYE) and lightmap is None:
-        lightmap = _kysh_load_image(_kysh_find_lightmap_file(dirs))
+        lightmap = (_kysh_load_image(_kysh_find_lightmap_file(dirs)) or _kysh_find_lightmap_image(mat)
+                    or _kysh_lightmap_from_data())
     if kind == _K_BODY and images.get("_D") is None:
         kind = _K_SKIP
     return kind, images, lightmap
+
+def _kysh_node_slot_images(mat):
+    out = {}
+    if mat is None or not mat.use_nodes or mat.node_tree is None:
+        return out
+    for node in mat.node_tree.nodes:
+        if node.type != 'TEX_IMAGE' or node.image is None or not node.label:
+            continue
+        slot = node.label.split(" (", 1)[0].strip()
+        if slot in _KYSH_JSON_SLOTS and slot not in out:
+            out[slot] = node.image
+    return out
+
+
+def _kysh_image_by_stem(stem, mat=None):
+    want = stem.lower()
+    if mat is not None and mat.use_nodes and mat.node_tree is not None:
+        for node in mat.node_tree.nodes:
+            if node.type == 'TEX_IMAGE' and node.image is not None and _kysh_img_base(node.image).lower() == want:
+                return node.image
+    hits = [img for img in bpy.data.images if img.type == 'IMAGE' and _kysh_img_base(img).lower() == want]
+    for img in hits:
+        if img.packed_file is not None or (img.filepath and os.path.isfile(bpy.path.abspath(img.filepath))):
+            return img
+    return hits[0] if hits else None
+
+
+def _kysh_image_dirs(images, folder=None):
+    dirs = []
+    for img in images:
+        if img is None or not img.filepath:
+            continue
+        d = os.path.dirname(bpy.path.abspath(img.filepath))
+        if d and os.path.isdir(d):
+            dirs.extend(_kysh_search_dirs(d))
+    dirs.extend(_kysh_search_dirs(folder))
+    if bpy.data.filepath:
+        dirs.extend(_kysh_search_dirs(os.path.dirname(bpy.data.filepath)))
+    out = []
+    for d in dirs:
+        if d not in out:
+            out.append(d)
+    return out
+
+
+def _kysh_fill_siblings(images, mat=None, folder=None):
+    d_img = images.get("_D")
+    if d_img is None:
+        return images
+    m = re.match(r"^(.*?)[_\-. ]?(d|diffuse|albedo|basecolor|color)$", _kysh_img_base(d_img), re.I)
+    if not m or not m.group(1):
+        return images
+    base = m.group(1)
+    dirs = None
+    for suffix in ("_M", "_A", "_N"):
+        if images.get(suffix) is not None:
+            continue
+        img = _kysh_image_by_stem(base + suffix, mat)
+        if img is None:
+            if dirs is None:
+                dirs = _kysh_image_dirs([d_img], folder)
+            img = _kysh_load_image(_kysh_find_texture_file(dirs, base + suffix))
+        if img is not None:
+            images[suffix] = img
+    return images
+
+
+def _kysh_lightmap_from_data():
+    for img in bpy.data.images:
+        key = img.name.lower().replace(" ", "").replace("_", "")
+        if "facelightmap" in key:
+            return img
+    return None
+
 
 def _kysh_pretty(mat_name):
     n = _kysh_strip_dup(mat_name)
@@ -1172,7 +1253,7 @@ def _kysh_ol_skip(mat):
     if mat is None:
         return True
     role = mat.get(_KYSH_ROLE)
-    if role:
+    if role or mat.get(_KYSH_EYE_TAG):
         return True
     return _kysh_strip_dup(mat.name) in (_KYSH_EYE_SHADOW, _KYSH_EYE_HL, _KYSH_EYE_TRANSPARENT)
 
@@ -1390,6 +1471,25 @@ def _kysh_ol_clear_drivers(owner, prefixes):
             ad.drivers.remove(fc)
 
 
+def _kysh_ol_vgroup(obj):
+    vg = obj.vertex_groups.get(_KYSH_OL_VGROUP)
+    if vg is not None:
+        obj.vertex_groups.remove(vg)
+    vg = obj.vertex_groups.new(name=_KYSH_OL_VGROUP)
+    me = obj.data
+    a = me.attributes.get(_KYSH_OL_WIDTH)
+    if a is None or a.domain != 'POINT':
+        return vg
+    w = np.empty(len(me.vertices), dtype=np.float32)
+    a.data.foreach_get("value", w)
+    w = np.clip(w, 0.0, 1.0)
+    for value in np.unique(w):
+        if value <= 0.0:
+            continue
+        vg.add(np.nonzero(w == value)[0].tolist(), float(value), 'REPLACE')
+    return vg
+
+
 def _kysh_ol_remove(obj):
     _kysh_ol_clear_drivers(obj, ('modifiers["%s"]' % _KYSH_OL_MOD, 'modifiers["%s"]' % _KYSH_OL_FACE_MOD))
     for m in list(obj.modifiers):
@@ -1397,6 +1497,9 @@ def _kysh_ol_remove(obj):
             obj.modifiers.remove(m)
     if _KYSH_OL_MASTER in obj:
         del obj[_KYSH_OL_MASTER]
+    vg = obj.vertex_groups.get(_KYSH_OL_VGROUP)
+    if vg is not None:
+        obj.vertex_groups.remove(vg)
     _kysh_ol_strip_slots(obj)
     me = obj.data
     for nm in (_KYSH_OL_WELD, _KYSH_OL_WIDTH, _KYSH_OL_MAT):
@@ -1558,6 +1661,9 @@ def _kysh_add_outlines(context, fast):
             mod.use_rim = False
             mod.material_offset = n
             mod.thickness = _KYSH_OL_FACE_THICKNESS
+            _kysh_ol_vgroup(obj)
+            mod.vertex_group = _KYSH_OL_VGROUP
+            mod.thickness_vertex_group = 0.0
         else:
             mod = obj.modifiers.new(_KYSH_OL_MOD, 'NODES')
             mod.node_group = group
@@ -1579,8 +1685,6 @@ def _kysh_add_outlines(context, fast):
         obj.update_tag()
     return len(done)
 
-
-# conversion
 
 def _kysh_convert_object(obj, body_src, face_src, cache, raw_folder=None):
     count = 0
@@ -1608,8 +1712,15 @@ def _kysh_convert_object(obj, body_src, face_src, cache, raw_folder=None):
             continue
         base = _kysh_strip_dup(mat.name)
         new = None
-        if base in _KYSH_BODY_MATERIALS and body_src is not None:
+        if base == "ZZZ EyeHighlights" and (_kysh_eye_hl_source() is not None or face_src is not None):
+            img = _kysh_ol_image(mat) or _kysh_object_face_image(obj)
+            new = _kysh_eye_hl_material(img)
+            if new is None:
+                new = _kysh_build_face(face_src, img, face_src.name + _KYSH_BODY_MATERIALS[base])
+                new[_KYSH_EYE_TAG] = True
+        elif base in _KYSH_BODY_MATERIALS and body_src is not None:
             images = {sfx: _kysh_find_map_image(mat, sfx) for sfx, _n, _s in _KYSH_BODY_MAPS}
+            _kysh_fill_siblings(images, mat, _kysh_material_dir(mat) or raw_folder)
             new = _kysh_build_body(body_src, images, body_src.name + _KYSH_BODY_MATERIALS[base])
         elif base == _KYSH_FACE_MATERIAL and face_src is not None:
             lightmap = _kysh_find_lightmap_image(mat)
@@ -1627,6 +1738,7 @@ def _kysh_convert_object(obj, body_src, face_src, cache, raw_folder=None):
                 new = _kysh_build_face(face_src, images.get("_D"), face_src.name + label, lightmap)
             elif kind == _K_EYE and face_src is not None:
                 new = _kysh_build_face(face_src, images.get("_D"), face_src.name + label, lightmap)
+                new[_KYSH_EYE_TAG] = True
             elif kind == _K_BODY and body_src is not None:
                 new = _kysh_build_body(body_src, images, body_src.name + label)
             elif kind == _K_HIDE:
@@ -1977,7 +2089,7 @@ class JIDEEH_OT_kythera_fix_colorspace(Operator):
 #  no asset at all, then it uses githubs source zip for the tag
 #tag needs the version in it like v1.6.2 and it shud match bl_info version or itll keep nagging u
 
-_KYSH_REPO = "Jideeh1/Kythera-s-Shader"
+_KYSH_REPO = "Jideeh1/Kytheras-ZZZ-Shader"
 _KYSH_API = "https://api.github.com/repos/%s/releases" % _KYSH_REPO
 _KYSH_RELEASES_PAGE = "https://github.com/%s/releases" % _KYSH_REPO
 _KYSH_UA = "Kythera-Shader-Updater"
