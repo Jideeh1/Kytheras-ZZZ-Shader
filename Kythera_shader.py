@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Kythera Shader",
     "author": "Jideeh",
-    "version": (1, 7, 0),
+    "version": (1, 7, 1),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Kythera",
     "description": "Swap ZZZ shaders for Kythera's ZZZ Shader and carry over textures. "
@@ -446,13 +446,20 @@ def _kysh_eye_shadow_material(face_img):
     mat[_KYSH_ROLE] = "eye_shadow"
     nt = _kysh_mat_tree(mat)
     nt.nodes.clear()
-    tex = _kysh_new_node(nt, 'ShaderNodeTexImage', (-500, 0))
+    tex = _kysh_new_node(nt, 'ShaderNodeTexImage', (-200, 50))
     tex.name = tex.label = "Face_D"
     tex.image = face_img
-    bsdf = _kysh_new_node(nt, 'ShaderNodeBsdfTransparent', (-150, 0))
-    out = _kysh_new_node(nt, 'ShaderNodeOutputMaterial', (100, 0))
+    tex.interpolation = 'Cubic'
+    tex.width = 240.0
+    bsdf = _kysh_new_node(nt, 'ShaderNodeBsdfTransparent', (180, 30))
+    bsdf2 = _kysh_new_node(nt, 'ShaderNodeBsdfTransparent', (190, -100))
+    mix = _kysh_new_node(nt, 'ShaderNodeMixShader', (380, 10))
+    mix.inputs[0].default_value = 0.5
+    out = _kysh_new_node(nt, 'ShaderNodeOutputMaterial', (560, 50))
     nt.links.new(tex.outputs["Color"], bsdf.inputs["Color"])
-    nt.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+    nt.links.new(bsdf.outputs["BSDF"], mix.inputs[1])
+    nt.links.new(bsdf2.outputs["BSDF"], mix.inputs[2])
+    nt.links.new(mix.outputs["Shader"], out.inputs["Surface"])
     try:
         mat.surface_render_method = 'BLENDED'
     except (AttributeError, TypeError):
@@ -483,9 +490,12 @@ def _kysh_eye_hl_material(face_img):
     except ReferenceError:
         src = None
     if src is not None:
-        mat = src.copy()
-        mat.name = _KYSH_EYE_HL
+        mat = src if src.get(_KYSH_ROLE) != "eye_highlight" and src.users == 0 else src.copy()
         mat[_KYSH_ROLE] = "eye_highlight"
+        try:
+            mat.surface_render_method = 'BLENDED'
+        except (AttributeError, TypeError):
+            pass
         tex = _kysh_hl_tex(mat)
         if tex is not None:
             tex.image = face_img
@@ -531,7 +541,7 @@ def _kysh_eye_masks(me):
         raw = raw[vi]
     r = np.rint(raw[:, 0] * 255.0)
     g = np.rint(raw[:, 1] * 255.0)
-    shadow = (r >= 1) & (r <= 2) & (g == 0)
+    shadow = (r >= 1) & (r <= 2) & ((g == 0) | (g == 3))
     hl = ((r == 0) & (g == 3)) | ((r == 3) & (g == 4))
     starts = np.empty(len(me.polygons), dtype=np.int32)
     me.polygons.foreach_get("loop_start", starts)
@@ -1255,7 +1265,8 @@ def _kysh_ol_skip(mat):
     role = mat.get(_KYSH_ROLE)
     if role or mat.get(_KYSH_EYE_TAG):
         return True
-    return _kysh_strip_dup(mat.name) in (_KYSH_EYE_SHADOW, _KYSH_EYE_HL, _KYSH_EYE_TRANSPARENT)
+    return (_kysh_strip_dup(mat.name) in (_KYSH_EYE_SHADOW, _KYSH_EYE_HL, _KYSH_EYE_TRANSPARENT)
+            or mat.name.startswith(_KYSH_EYE_HL_PREFIX))
 
 
 def _kysh_ol_strip_slots(obj):
